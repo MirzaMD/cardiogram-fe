@@ -89,6 +89,39 @@ const spoOf = (o) => {
   try { const v = validSpo2(o); return Array.isArray(v) ? v.map(Number).filter(Number.isFinite) : []; }
   catch { return []; }
 };
+
+// Raw MAX30102 PPG → { ir: [], red: [] }, all windows concatenated in order.
+// Stored shape (current):  oxygen_info = [ { ir: [...], red: [...] }, { ir: [...], red: [...] }, ... ]
+// Also tolerated:          a single { ir, red } object, or the older [window][sample][IR, RED] pairs.
+const ppgOf = (o) => {
+  const ir = [], red = [];
+  const push = (a, b) => {
+    a = Number(a); b = Number(b);
+    if (Number.isFinite(a) && Number.isFinite(b) && a > 0 && b > 0) { ir.push(a); red.push(b); }  // drop empty-sensor zeros
+  };
+  const wins = Array.isArray(o) ? o : o ? [o] : [];
+  for (const w of wins) {
+    if (!w) continue;
+    if (!Array.isArray(w) && typeof w === 'object') {            // { ir: [...], red: [...] }
+      const A = Array.isArray(w.ir) ? w.ir : [], B = Array.isArray(w.red) ? w.red : [];
+      const n = Math.min(A.length, B.length);
+      for (let i = 0; i < n; i++) push(A[i], B[i]);
+    } else if (Array.isArray(w)) {
+      if (typeof w[0] === 'number') push(w[0], w[1]);             // flat list of [IR, RED] pairs
+      else for (const s of w) if (Array.isArray(s) && s.length >= 2) push(s[0], s[1]);  // window of pairs
+    }
+  }
+  return { ir, red };
+};
+
+// DC = mean, AC = std-dev / peak-to-peak. R is the "ratio of ratios" used for SpO₂ estimation.
+const ppgMetrics = (ir, red) => {
+  const a = ecgStats(ir), b = ecgStats(red);
+  if (!a || !b) return null;
+  const R = a.sd > 0 && a.mean > 0 && b.mean > 0 ? (b.sd / b.mean) / (a.sd / a.mean) : null;
+  return { ir: a, red: b, R, piIr: a.mean > 0 ? (a.p2p / a.mean) * 100 : null, piRed: b.mean > 0 ? (b.p2p / b.mean) * 100 : null };
+};
+
 const robustRange = (vals, q = 0.004) => {
   if (!vals.length) return [-1, 1];
   const s = Float32Array.from(vals).sort();
@@ -670,6 +703,31 @@ function SpoAxis({ range: [lo, hi] }) {
   return <div className="cg-axis">{ticks.map((v) => <span key={v} style={{ bottom: `${8 + (84 * (v - lo)) / (hi - lo)}%` }}>{v}</span>)}</div>;
 }
 
+/** Raw MAX30102 IR + RED channels with summary metrics. Used on Overview and on each record page. */
+function PpgView({ ppg, height = 190 }) {
+  const { ir, red } = ppg;
+  const m = useMemo(() => ppgMetrics(ir, red), [ir, red]);
+  if (ir.length < 2 || !m) {
+    return <div className="sensor-empty"><Waves size={25} /><strong>No raw IR / RED samples</strong><span>The MAX30102 returned no usable readings for this capture.</span></div>;
+  }
+  const n0 = (v) => (Number.isFinite(v) ? Math.round(v).toLocaleString() : '—');
+  return <>
+    <div className="cg-ppg-channel"><span className="cg-ppg-tag cg-ppg-ir"><i />IR (infrared)</span><Badge tone="violet">mean {n0(m.ir.mean)}</Badge></div>
+    <SignalScope mode="ecg" data={ir} color={toneHex('violet')} height={height} />
+    <div className="cg-ppg-channel"><span className="cg-ppg-tag cg-ppg-red"><i />RED</span><Badge tone="red">mean {n0(m.red.mean)}</Badge></div>
+    <SignalScope mode="ecg" data={red} color={toneHex('red')} height={height} />
+    <div className="oxygen-stats cg-ppg-stats">
+      <div><span>IR range</span><strong>{n0(m.ir.min)}–{n0(m.ir.max)}</strong></div>
+      <div><span>RED range</span><strong>{n0(m.red.min)}–{n0(m.red.max)}</strong></div>
+      <div><span>Perfusion (IR)</span><strong>{fmt(m.piIr, 2)}<small>%</small></strong></div>
+      <div><span>Perfusion (RED)</span><strong>{fmt(m.piRed, 2)}<small>%</small></strong></div>
+      <div><span>R ratio</span><strong>{fmt(m.R, 3)}</strong></div>
+      <div><span>Samples</span><strong>{ir.length}</strong></div>
+    </div>
+    <div className="medical-note"><AlertTriangle size={15} /><span>Raw sensor counts, auto-scaled. Perfusion and R are informational, not a diagnosis.</span></div>
+  </>;
+}
+
 /* =====================================================================
    4. UI PRIMITIVES (unchanged look)
    ===================================================================== */
@@ -750,6 +808,7 @@ function Overview({ deviceOnline, healthError = '', cap, onStart, onReset }) {
   const windows = useMemo(() => windowsOf(rec), [rec]);
   const ecg = useMemo(() => windows.flat(), [windows]);
   const spo = useMemo(() => spoOf(rec?.oxygen_info), [rec]);
+  const ppg = useMemo(() => ppgOf(rec?.oxygen_info), [rec]);
 
   if (phase === 'result' && rec) {
     const pred = labelOf(rec.prediction), avg = mean(spo), range = spo2Range(spo);
@@ -765,6 +824,10 @@ function Overview({ deviceOnline, healthError = '', cap, onStart, onReset }) {
             ? <><SignalScope mode="spo2" data={spo} yRange={range} color={toneHex(spoTone(avg))} height={220}><SpoAxis range={range} /></SignalScope>
               <div className="oxygen-stats"><div><span>Minimum</span><strong>{fmt(Math.min(...spo), 1)}<small>%</small></strong></div><div><span>Maximum</span><strong>{fmt(Math.max(...spo), 1)}<small>%</small></strong></div><div><span>Valid samples</span><strong>{spo.length}</strong></div></div></>
             : <div className="sensor-empty"><Waves size={25} /><strong>Pulse-ox sensor not detected</strong><span>No valid samples between 50% and 100% were found.</span></div>}
+        </section>
+        <section className="panel">
+          <div className="panel-head"><div><div className="panel-kicker">RAW PHOTOPLETHYSMOGRAM</div><h3>IR &amp; RED signals</h3><p>MAX30102 channels · scrolling playback</p></div>{ppg.ir.length > 1 && <Badge tone="violet">{ppg.ir.length} samples</Badge>}</div>
+          <PpgView ppg={ppg} height={170} />
         </section>
       </div>
       <aside className="cg-result-right">
@@ -808,7 +871,7 @@ function Analysis({ records, loading, error, onRefresh }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { onRefresh(); }, []);
 
-  const rows = useMemo(() => records.map((r) => ({ r, spo: mean(spoOf(r.oxygen_info)) })), [records]);
+  const rows = useMemo(() => records.map((r) => ({ r, spo: mean(spoOf(r.oxygen_info)), ppgN: ppgOf(r.oxygen_info).ir.length })), [records]);
   const filtered = rows.filter(({ r }) => {
     const l = labelOf(r.prediction), q = search.toLowerCase();
     const matches = `${r.id} ${r.device_id} ${l.name} ${l.code}`.toLowerCase().includes(q);
@@ -831,7 +894,7 @@ function Analysis({ records, loading, error, onRefresh }) {
     <section className="panel table-panel"><div className="table-toolbar"><div><h3>All captures</h3><p>Records are sorted by record ID, newest first.</p></div><div className="table-filters"><div className="search-box"><Search size={16} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search record ID…" /></div><select value={filter} onChange={(e) => setFilter(e.target.value)}><option value="all">All records</option><option value="unlabelled">Unlabelled</option><option value="labelled">Labelled</option></select></div></div>
       {error && <div className="inline-error"><AlertTriangle size={16} />{error}</div>}
       {loading && !records.length ? <div className="loading-state"><LoaderCircle className="spin" size={24} /> Loading records…</div>
-        : filtered.length ? <div className="table-scroll"><table><thead><tr><th>RECORD</th><th>AI PREDICTION</th><th>TRUE LABEL</th><th>ECG WINDOWS</th><th>MEAN SpO₂</th><th>DEVICE</th><th></th></tr></thead><tbody>{filtered.map(({ r, spo }) => { const l = labelOf(r.prediction); return <tr key={r.id}><td><NavLink className="table-record" to={`/analysis/${r.id}`}><span className="table-record-icon"><Activity size={16} /></span><span><strong>Record #{r.id}</strong><small>Saved capture</small></span></NavLink></td><td><Badge tone={l.tone}>{l.code} · {l.name}</Badge></td><td>{isUnlabelled(r) ? <Badge tone="amber">Unlabelled</Badge> : <Badge tone="green">{labelOf(r.true_label).code}</Badge>}</td><td>{windowsOf(r).length} windows</td><td>{spo === null ? '—' : `${spo.toFixed(1)}%`}</td><td>Device {r.device_id ?? '—'}</td><td><NavLink to={`/analysis/${r.id}`} className="table-open">Open <ChevronRight size={14} /></NavLink></td></tr>; })}</tbody></table></div>
+        : filtered.length ? <div className="table-scroll"><table><thead><tr><th>RECORD</th><th>AI PREDICTION</th><th>TRUE LABEL</th><th>ECG WINDOWS</th><th>MEAN SpO₂</th><th>IR / RED</th><th>DEVICE</th><th></th></tr></thead><tbody>{filtered.map(({ r, spo, ppgN }) => { const l = labelOf(r.prediction); return <tr key={r.id}><td><NavLink className="table-record" to={`/analysis/${r.id}`}><span className="table-record-icon"><Activity size={16} /></span><span><strong>Record #{r.id}</strong><small>Saved capture</small></span></NavLink></td><td><Badge tone={l.tone}>{l.code} · {l.name}</Badge></td><td>{isUnlabelled(r) ? <Badge tone="amber">Unlabelled</Badge> : <Badge tone="green">{labelOf(r.true_label).code}</Badge>}</td><td>{windowsOf(r).length} windows</td><td>{spo === null ? '—' : `${spo.toFixed(1)}%`}</td><td>{ppgN ? `${ppgN} samples` : '—'}</td><td>Device {r.device_id ?? '—'}</td><td><NavLink to={`/analysis/${r.id}`} className="table-open">Open <ChevronRight size={14} /></NavLink></td></tr>; })}</tbody></table></div>
           : <div className="empty-state"><div className="empty-icon"><ClipboardList size={25} /></div><h3>{records.length ? 'No matching records' : 'No records to show'}</h3><p>{records.length ? 'Try a different search or filter.' : 'When a capture is saved on the edge device, it will appear here.'}</p><Button variant="secondary" onClick={onRefresh} icon={RefreshCw}>Try again</Button></div>}
       <div className="table-foot"><span>Showing {filtered.length} of {records.length} records</span><span>Edge device data</span></div></section></>;
 }
@@ -846,6 +909,7 @@ function RecordDetail({ records, loading, fallback, onRecordsChange }) {
   const windows = useMemo(() => windowsOf(record), [record]);
   const ecg = useMemo(() => windows.flat(), [windows]);
   const spo = useMemo(() => spoOf(record?.oxygen_info), [record]);
+  const ppg = useMemo(() => ppgOf(record?.oxygen_info), [record]);
   const stats = useMemo(() => ecgStats(ecg), [ecg]);
   const [label, setLabel] = useState('');
   const [saving, setSaving] = useState(false);
@@ -874,7 +938,7 @@ function RecordDetail({ records, loading, fallback, onRecordsChange }) {
 
   return <><div className="back-link-wrap"><button className="back-link" onClick={() => navigate('/analysis')}>← Back to records</button></div>
     <PageHeader eyebrow={`RECORD #${record.id}`} title="Capture analysis" subtitle="Inspect the ECG signal, oxygen samples, and model output." action={<Badge tone={unl ? 'amber' : 'green'} dot>{unl ? 'Awaiting clinician review' : 'Clinician labelled'}</Badge>} />
-    <div className="detail-metrics"><div><span>AI prediction</span><strong>{pred.code} · {pred.name}</strong></div><div><span>Device ID</span><strong>{record.device_id ?? '—'}</strong></div><div><span>ECG windows</span><strong>{windows.length}</strong></div><div><span>Mean SpO₂</span><strong>{avg === null ? 'Sensor not detected' : `${avg.toFixed(1)}%`}</strong></div></div>
+    <div className="detail-metrics"><div><span>AI prediction</span><strong>{pred.code} · {pred.name}</strong></div><div><span>Device ID</span><strong>{record.device_id ?? '—'}</strong></div><div><span>ECG windows</span><strong>{windows.length}</strong></div><div><span>Mean SpO₂</span><strong>{avg === null ? 'Sensor not detected' : `${avg.toFixed(1)}%`}</strong></div><div><span>PPG samples</span><strong>{ppg.ir.length || 'None'}</strong></div></div>
     <div className="cg-detail-grid">
       <div className="cg-detail-col">
         <section className="panel"><div className="panel-head"><div><div className="panel-kicker"><span className="live-pulse" /> SIGNAL PLAYBACK</div><h3>ECG waveform</h3><p>All windows · concatenated</p></div><Badge tone="neutral">{ecg.length} samples</Badge></div><SignalScope mode="ecg" data={ecg} color={0x43d9c4} height={240} /></section>
@@ -886,6 +950,8 @@ function RecordDetail({ records, loading, fallback, onRecordsChange }) {
             <div className="oxygen-stats"><div><span>Minimum</span><strong>{fmt(Math.min(...spo), 1)}<small>%</small></strong></div><div><span>Maximum</span><strong>{fmt(Math.max(...spo), 1)}<small>%</small></strong></div><div><span>Samples</span><strong>{spo.length}</strong></div></div></>
             : <div className="sensor-empty"><Waves size={25} /><strong>Pulse-ox sensor not detected</strong><span>No valid samples between 50% and 100% were found.</span></div>}
           <div className="medical-note"><AlertTriangle size={15} /><span>Display bands are informational only and are not a diagnosis.</span></div></section>
+        <section className="panel"><div className="panel-head"><div><div className="panel-kicker">RAW PPG</div><h3>IR &amp; RED channels</h3><p>Unprocessed MAX30102 samples for this record</p></div>{ppg.ir.length > 1 && <Badge tone="violet">{ppg.ir.length} samples</Badge>}</div>
+          <PpgView ppg={ppg} height={170} /></section>
         <section className="panel"><div className="panel-head"><div><div className="panel-kicker">SIGNAL STATISTICS</div><h3>ECG analysis</h3><p>Computed from the stored samples</p></div></div>
           {stats ? <div className="cg-stat-list"><div><span>Samples</span><strong>{stats.n}</strong></div><div><span>Peak-to-peak</span><strong>{fmt(stats.p2p, 3)}</strong></div><div><span>Minimum</span><strong>{fmt(stats.min, 3)}</strong></div><div><span>Maximum</span><strong>{fmt(stats.max, 3)}</strong></div><div><span>Mean</span><strong>{fmt(stats.mean, 3)}</strong></div><div><span>Std. deviation</span><strong>{fmt(stats.sd, 3)}</strong></div><div><span>Peak candidates</span><strong>{stats.peaks}</strong></div></div> : <p className="subtle-note">No ECG samples stored for this record.</p>}
           <div className="heart-rate-placeholder"><HeartPulse size={19} /><div><strong>Heart rate</strong><span>Unavailable until the sampling rate and R-peak detection are configured.</span></div></div></section>
